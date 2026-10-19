@@ -8,7 +8,7 @@ Many Windows apps (dev tools, sync clients, schedulers, AI agents...) silently s
 
 ## The fix
 
-`KeepTerminalsBehind.ps1` is **event-driven**: it registers Windows event hooks (`SetWinEventHook`) and reacts within milliseconds of a console window taking focus or becoming visible — pushing it to the bottom of the Z-order with `SetWindowPos(HWND_BOTTOM)` and handing focus back to the window you were using. A lightweight 1-second sweep runs as a backstop for consoles that appear without taking focus.
+`KeepTerminalsBehind.ps1` is **event-driven**: it registers Windows event hooks (`SetWinEventHook`) and reacts within milliseconds of a console window taking focus or becoming visible — pushing it to the bottom of the Z-order with `SetWindowPos(HWND_BOTTOM)` and handing focus back to the window you were using. A fast 100ms sweep runs as a backstop for consoles that appear or get raised without taking focus.
 
 ### Safety rules
 
@@ -44,7 +44,8 @@ Removes the Startup shortcut (and stops the running watcher if you pass `-StopRu
 
 - A terminal window **you** launch will be suppressed once when it opens — click it once (cursor over the window) and it stays put while you use it.
 - Works with classic consoles (`conhost`), pseudo-consoles, and Windows Terminal.
-- Newer Windows Terminal versions refuse `SetWindowPos` z-order changes (win32 error 0/1400). In that case the script automatically **minimizes** the popup instead — async, so it can never hang.
+- Newer Windows Terminal versions refuse `SetWindowPos` z-order changes (win32 error 0/1400). In that case the script falls back to **minimize** (1st offense) and **hide** (2nd+ offense) — async, so it can never hang.
+- A fast 100ms backstop sweep catches windows that get raised without taking focus.
 - Diagnostics are logged to `%TEMP%\KeepTerminalsBehind.log` (disable with `-DisableLog`).
 
 ## Requirements
