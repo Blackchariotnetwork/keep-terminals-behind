@@ -42,8 +42,10 @@ Removes the Startup shortcut (and stops the running watcher if you pass `-StopRu
 
 ## Notes
 
-- A terminal window **you** launch will be pushed to the back once when it opens — click it once and it stays put while you use it.
-- Works with classic consoles (`conhost`) and Windows Terminal.
+- A terminal window **you** launch will be suppressed once when it opens — click it once (cursor over the window) and it stays put while you use it.
+- Works with classic consoles (`conhost`), pseudo-consoles, and Windows Terminal.
+- Newer Windows Terminal versions refuse `SetWindowPos` z-order changes (win32 error 0/1400). In that case the script automatically **minimizes** the popup instead — async, so it can never hang.
+- Diagnostics are logged to `%TEMP%\KeepTerminalsBehind.log` (disable with `-DisableLog`).
 
 ## Requirements
 
