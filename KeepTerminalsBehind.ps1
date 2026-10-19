@@ -1,25 +1,25 @@
 <#
 .SYNOPSIS
-  Keeps cmd / PowerShell / Windows Terminal windows at the bottom of the
-  window stack so they never interrupt your workflow.
+  Keeps cmd / PowerShell / Windows Terminal windows from interrupting you.
 
 .DESCRIPTION
-  v4 - EVENT-DRIVEN with cursor-based intent detection.
+  v6 - EVENT-DRIVEN with fast sweep + two-strike suppression.
 
-  Registers Windows event hooks (SetWinEventHook) and reacts within
-  milliseconds of a console window taking focus (EVENT_SYSTEM_FOREGROUND)
-  or becoming visible (EVENT_OBJECT_SHOW):
+  Registers Windows event hooks (SetWinEventHook) for focus changes and
+  window-show events, plus a fast 100ms sweep as a backstop for windows
+  that get raised without taking focus.
 
-    - If the MOUSE CURSOR is over the console window when it takes focus,
-      the user put it there on purpose -> left alone.
-    - Otherwise it is a script-spawned popup -> pushed to the bottom of the
-      Z-order and focus is returned to the window you were using.
+  Suppression ladder for a popup console window:
+    1st offense: minimized (still findable in the taskbar)
+    2nd offense: hidden completely (no screen, no taskbar entry)
 
-  A lightweight 1-second sweep runs as a backstop.
+  Safety rules:
+    - If the MOUSE CURSOR is over a console window when it takes focus,
+      YOU put it there -> it is marked user-owned and never suppressed.
+    - Minimized/hidden windows are left alone.
+    - Regular windows (browsers, editors, etc.) are never touched.
 
-  DIAGNOSTICS: every decision is logged to %TEMP%\KeepTerminalsBehind.log
-  (disable with -DisableLog). SetWindowPos failures (e.g. elevated windows
-  that a normal-privilege process may not reorder) are logged too.
+  Diagnostics: logged to %TEMP%\KeepTerminalsBehind.log (-DisableLog to stop).
 
   To stop it:
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
@@ -56,27 +56,23 @@ namespace KTB
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate pfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
-        [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-        [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        const int SW_MINIMIZE = 6;
-        const uint WM_SYSCOMMAND = 0x0112;
-        const uint SC_MINIMIZE = 0xF020;
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
         [DllImport("user32.dll")] static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
         [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG lpMsg);
         [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG lpMsg);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
         public struct MSG { public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam; public uint time; public int pt_x; public int pt_y; }
         public struct POINT { public int X; public int Y; }
@@ -89,17 +85,22 @@ namespace KTB
         static readonly IntPtr HWND_BOTTOM = new IntPtr(6);
         const uint SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200; // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER
         const uint GW_HWNDLAST = 1;
-        const byte VK_MENU = 0x12; // ALT
+        const byte VK_MENU = 0x12;
         const uint KEYEVENTF_KEYUP = 2;
+        const int SW_MINIMIZE = 6;
+        const int SW_HIDE = 0;
 
-        static readonly string[] ConsoleClasses = new string[] { "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS" };
+        static readonly string[] ConsoleClasses = new string[] { "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow" };
+        const string DragBarClass = "DRAG_BAR_WINDOW_CLASS"; // WT-internal child window - never touch
         static HashSet<string> procNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // ---------- state ----------
         static readonly object gate = new object();
         static IntPtr lastGood = IntPtr.Zero;
+        static readonly HashSet<IntPtr> userOwned = new HashSet<IntPtr>();     // consoles the user clicked into
+        static readonly Dictionary<IntPtr, int> violations = new Dictionary<IntPtr, int>();
         static string logPath = "";
-        static WinEventDelegate fgHandler;   // keep delegates alive (GC)
+        static WinEventDelegate fgHandler;
         static WinEventDelegate showHandler;
 
         static void Log(string fmt, params object[] args)
@@ -136,6 +137,7 @@ namespace KTB
             var sb = new System.Text.StringBuilder(256);
             GetClassName(hwnd, sb, 256);
             string cls = sb.ToString();
+            if (cls == DragBarClass) return false;   // WT-internal child, never manage
             foreach (string c in ConsoleClasses) if (cls == c) return true;
 
             uint pid;
@@ -155,24 +157,27 @@ namespace KTB
             return last == IntPtr.Zero || last == hwnd;
         }
 
-        static bool PushBottom(IntPtr hwnd)
+        // Suppression ladder: minimize once, then hide on repeat offenses
+        static void Suppress(IntPtr hwnd, string reason)
         {
-            bool ok = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_FLAGS);
-            if (ok) return true;
-
-            // Fallback: SetWindowPos is refused for some window hosts (e.g. newer
-            // Windows Terminal windows). A minimized popup can't cover your work.
-            // ShowWindowAsync/PostMessage are async so they can never hang us.
-            int err = Marshal.GetLastWin32Error();
-            Log("PUSH FAILED win32error={1} {0} - trying minimize fallback", Describe(hwnd), err);
-            bool min1 = ShowWindowAsync(hwnd, SW_MINIMIZE);
-            if (!min1)
+            int count;
+            lock (gate)
             {
-                Log("ShowWindowAsync failed - posting SC_MINIMIZE to {0}", Describe(hwnd));
-                PostMessage(hwnd, WM_SYSCOMMAND, (IntPtr)SC_MINIMIZE, IntPtr.Zero);
+                if (!violations.TryGetValue(hwnd, out count)) count = 0;
+                violations[hwnd] = count + 1;
+                count = count + 1;
             }
-            Log("MINIMIZED (fallback) {0}", Describe(hwnd));
-            return false;
+
+            if (count >= 2)
+            {
+                ShowWindowAsync(hwnd, SW_HIDE);
+                Log("SUPPRESSED ({0}) strike {1} -> HIDDEN {2}", reason, count, Describe(hwnd));
+            }
+            else
+            {
+                ShowWindowAsync(hwnd, SW_MINIMIZE);
+                Log("SUPPRESSED ({0}) strike {1} -> minimized {2}", reason, count, Describe(hwnd));
+            }
         }
 
         static void RestoreFocus(IntPtr hwnd)
@@ -186,13 +191,19 @@ namespace KTB
         // EVENT_OBJECT_SHOW: a window just became visible
         static void ShowHandler(IntPtr hHook, uint eventId, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
         {
-            if (idObject != 0) return; // only OBJID_WINDOW
+            if (idObject != 0) return;
             if (!IsConsoleWindow(hwnd)) return;
             if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
 
             IntPtr fg = GetForegroundWindow();
             if (fg == hwnd) HandleForeground(hwnd);
-            else { PushBottom(hwnd); Log("SHOW -> pushed {0}", Describe(hwnd)); }
+            else
+            {
+                bool owned;
+                lock (gate) { owned = userOwned.Contains(hwnd); }
+                if (owned) return;
+                Suppress(hwnd, "show");
+            }
         }
 
         // EVENT_SYSTEM_FOREGROUND: the foreground window changed
@@ -209,14 +220,11 @@ namespace KTB
             if (!IsConsoleWindow(hwnd))
             {
                 lock (gate) { lastGood = hwnd; }
-                Log("FG -> normal window {0}", Describe(hwnd));
                 return;
             }
 
             if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
 
-            // Cursor-based intent: if the mouse is over the console window,
-            // the user put it in front on purpose -> leave it alone.
             POINT p; RECT r;
             GetCursorPos(out p);
             GetWindowRect(hwnd, out r);
@@ -224,26 +232,20 @@ namespace KTB
 
             if (cursorInside)
             {
-                Log("FG -> console {0} CURSOR INSIDE - leaving alone", Describe(hwnd));
+                lock (gate) { userOwned.Add(hwnd); }
+                Log("FG -> console {0} CURSOR INSIDE - user-owned, protected", Describe(hwnd));
                 return;
             }
 
             if (hwnd == lastGood) return;
 
-            if (lastGood != IntPtr.Zero)
-            {
-                Log("FG -> console {0} POPUP - pushing behind + restoring focus", Describe(hwnd));
-                PushBottom(hwnd);
-                RestoreFocus(lastGood);
-            }
-            else
-            {
-                Log("FG -> console {0} POPUP (no lastGood) - pushing behind", Describe(hwnd));
-                PushBottom(hwnd);
-            }
+            Log("FG -> console {0} POPUP (cursor elsewhere)", Describe(hwnd));
+            Suppress(hwnd, "fg");
+            RestoreFocus(lastGood);
         }
 
-        // Backstop sweep
+        // Fast backstop: catches windows raised WITHOUT taking focus,
+        // which is exactly what keeps flashing in front of the browser.
         static void Backstop(object state)
         {
             try
@@ -254,10 +256,11 @@ namespace KTB
                 {
                     if (IsWindowVisible(h) && !IsIconic(h) && IsConsoleWindow(h))
                     {
-                        if (h != fg && !IsAtBottom(h))
-                        {
-                            if (PushBottom(h)) Log("SWEEP -> pushed {0}", Describe(h));
-                        }
+                        bool owned;
+                        lock (gate) { owned = userOwned.Contains(h); }
+                        if (h == fg || owned) return true;
+                        if (IsAtBottom(h)) return true;
+                        Suppress(h, "sweep");
                     }
                     return true;
                 }, IntPtr.Zero);
@@ -265,6 +268,20 @@ namespace KTB
                 if (fg != IntPtr.Zero && !IsConsoleWindow(fg))
                 {
                     lock (gate) { lastGood = fg; }
+                }
+
+                // prune dead handles
+                lock (gate)
+                {
+                    if (userOwned.Count > 50 || violations.Count > 50)
+                    {
+                        var deadU = new List<IntPtr>();
+                        foreach (var h in userOwned) if (!IsWindow(h)) deadU.Add(h);
+                        foreach (var h in deadU) userOwned.Remove(h);
+                        var deadV = new List<IntPtr>();
+                        foreach (var kv in violations) if (!IsWindow(kv.Key)) deadV.Add(kv.Key);
+                        foreach (var h in deadV) violations.Remove(h);
+                    }
                 }
             }
             catch { }
@@ -274,7 +291,7 @@ namespace KTB
         {
             foreach (string n in names) procNames.Add(n);
             logPath = logFile == null ? "" : logFile;
-            Log("===== KeepTerminalsBehind v4 started =====");
+            Log("===== KeepTerminalsBehind v6 started =====");
 
             fgHandler = new WinEventDelegate(FgHandler);
             showHandler = new WinEventDelegate(ShowHandler);
@@ -284,7 +301,7 @@ namespace KTB
             Log("hooks: fg=0x{0} show=0x{1}", h1.ToString("X"), h2.ToString("X"));
             if (h1 == IntPtr.Zero && h2 == IntPtr.Zero) Log("WARNING: no hooks registered!");
 
-            var backstop = new System.Threading.Timer(Backstop, null, 1000, 1000);
+            var backstop = new System.Threading.Timer(Backstop, null, 100, 100);
 
             MSG msg;
             while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
@@ -297,7 +314,7 @@ namespace KTB
 }
 "@
 
-Write-Host "KeepTerminalsBehind v4 (event-driven + cursor intent) is running." -ForegroundColor Cyan
+Write-Host "KeepTerminalsBehind v6 (100ms sweep + two-strike suppression) is running." -ForegroundColor Cyan
 if ($script:LogPath) { Write-Host "Log: $script:LogPath" -ForegroundColor DarkGray }
 
 [KTB.Hook]::Run($script:ProcNames, $script:LogPath)
