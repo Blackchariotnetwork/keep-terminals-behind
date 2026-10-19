@@ -168,16 +168,11 @@ namespace KTB
                 count = count + 1;
             }
 
-            if (count >= 2)
-            {
-                ShowWindowAsync(hwnd, SW_HIDE);
-                Log("SUPPRESSED ({0}) strike {1} -> HIDDEN {2}", reason, count, Describe(hwnd));
-            }
-            else
-            {
-                ShowWindowAsync(hwnd, SW_MINIMIZE);
-                Log("SUPPRESSED ({0}) strike {1} -> minimized {2}", reason, count, Describe(hwnd));
-            }
+            // Hide immediately: popup consoles are one-shot script runs whose
+            // output goes to log files. Minimizing still flashes + shows in the
+            // taskbar, and popup bursts are all fresh windows anyway.
+            ShowWindowAsync(hwnd, SW_HIDE);
+            Log("SUPPRESSED ({0}) strike {1} -> HIDDEN {2}", reason, count, Describe(hwnd));
         }
 
         static void RestoreFocus(IntPtr hwnd)
