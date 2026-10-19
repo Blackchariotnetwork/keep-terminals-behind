@@ -8,7 +8,7 @@ Many Windows apps (dev tools, sync clients, schedulers, AI agents...) silently s
 
 ## The fix
 
-`KeepTerminalsBehind.ps1` polls once per second and silently pushes any visible console window to the bottom of the Z-order using `SetWindowPos(HWND_BOTTOM)`, **without activating anything**.
+`KeepTerminalsBehind.ps1` is **event-driven**: it registers Windows event hooks (`SetWinEventHook`) and reacts within milliseconds of a console window taking focus or becoming visible — pushing it to the bottom of the Z-order with `SetWindowPos(HWND_BOTTOM)` and handing focus back to the window you were using. A lightweight 1-second sweep runs as a backstop for consoles that appear without taking focus.
 
 ### Safety rules
 
@@ -40,6 +40,11 @@ powershell.exe -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 Removes the Startup shortcut (and stops the running watcher if you pass `-StopRunning`).
 
+## Notes
+
+- A terminal window **you** launch will be pushed to the back once when it opens — click it once and it stays put while you use it.
+- Works with classic consoles (`conhost`) and Windows Terminal.
+
 ## Requirements
 
 - Windows 10 / 11
@@ -49,7 +54,6 @@ Removes the Startup shortcut (and stops the running watcher if you pass `-StopRu
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-IntervalSeconds` | `1` | Seconds between z-order checks |
 | `-ProcessNames` | `cmd, powershell, pwsh, WindowsTerminal, conhost` | Process names treated as terminal popups |
 
 ## License
