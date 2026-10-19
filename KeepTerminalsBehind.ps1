@@ -4,179 +4,229 @@
   window stack so they never interrupt your workflow.
 
 .DESCRIPTION
-  Runs quietly in the background. It watches for console windows and:
+  v3 - EVENT-DRIVEN. Instead of polling, it registers Windows event hooks
+  (SetWinEventHook) and reacts within milliseconds of a console window:
 
-    - NEWLY SPAWNED console windows that grab focus ("flash" popups) are
-      pushed to the bottom of the Z-order and focus is returned to the
-      window you were using.
-    - Any other visible console window sitting above the bottom is silently
-      moved to the back without activating anything.
+    - taking focus (EVENT_SYSTEM_FOREGROUND)  -> pushed to the bottom and
+      focus is returned to the window you were using
+    - becoming visible (EVENT_OBJECT_SHOW)    -> pushed to the bottom
+
+  A lightweight 1s polling sweep runs as a backstop for anything the hooks
+  miss (e.g. consoles that appear without taking focus).
 
   Safety rules:
-    - A console window you deliberately clicked (already visible, then
-      became foreground) is NEVER touched while you're using it.
+    - A console you deliberately clicked (already visible, then became
+      foreground) is NEVER touched while you're using it.
     - Minimized windows are left alone.
     - Regular windows (browsers, editors, etc.) are never moved.
 
+  Note: a terminal window YOU launch will be pushed to the back once when
+  it opens; just click it once and it will stay put while you use it.
+
   To stop it:
-    Stop-Process -Id (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-      Where-Object { $_.CommandLine -match 'KeepTerminalsBehind' }).ProcessId
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+      Where-Object { $_.CommandLine -match 'KeepTerminalsBehind' } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId }
 
 .EXAMPLE
   powershell.exe -ExecutionPolicy Bypass -File .\KeepTerminalsBehind.ps1
 #>
 
 param(
-    # Seconds between checks
-    [double]$IntervalSeconds = 0.25,
-    # Process names treated as "terminal popups" (fallback matching)
     [string[]]$ProcessNames = @('cmd', 'powershell', 'pwsh', 'WindowsTerminal', 'conhost')
 )
 
-Add-Type -Name Win -Namespace Native -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+$script:ProcNames = $ProcessNames
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern System.IntPtr GetForegroundWindow();
+Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+namespace KTB
+{
+    public static class Hook
+    {
+        // ---------- Win32 ----------
+        delegate void WinEventDelegate(IntPtr hHook, uint eventId, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern System.IntPtr GetWindow(System.IntPtr hWnd, uint uCmd);
+        [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate pfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+        [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG lpMsg);
+        [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG lpMsg);
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool IsWindowVisible(System.IntPtr hWnd);
+        struct MSG { public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam; public uint time; public int pt_x; public int pt_y; }
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool IsIconic(System.IntPtr hWnd);
+        // ---------- constants ----------
+        const uint EVENT_SYSTEM_FOREGROUND = 0x0002;
+        const uint EVENT_OBJECT_SHOW       = 0x8002;
+        const uint WINEVENT_OUTOFCONTEXT   = 0;
+        static readonly IntPtr HWND_BOTTOM = new IntPtr(6);
+        const uint SWP_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200; // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER
+        const uint GW_HWNDLAST = 1;
+        const byte VK_MENU = 0x12; // ALT
+        const uint KEYEVENTF_KEYUP = 2;
 
-[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-public static extern int GetClassName(System.IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        static readonly string[] ConsoleClasses = new string[] { "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS" };
+        static HashSet<string> procNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
+        // ---------- state ----------
+        static readonly object gate = new object();
+        static readonly HashSet<IntPtr> knownVisible = new HashSet<IntPtr>();
+        static IntPtr lastGood = IntPtr.Zero;
+        static WinEventDelegate fgHandler;   // keep delegates alive (GC)
+        static WinEventDelegate showHandler;
 
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+        static bool IsConsoleWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            var sb = new System.Text.StringBuilder(256);
+            GetClassName(hwnd, sb, 256);
+            string cls = sb.ToString();
+            foreach (string c in ConsoleClasses) if (cls == c) return true;
 
-public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
-
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, System.IntPtr lParam);
-"@
-
-# Window classes that are console/terminal windows
-$ConsoleClasses = @('ConsoleWindowClass', 'CASCADIA_HOSTING_WINDOW_CLASS')
-
-# HWND_BOTTOM
-$HWND_BOTTOM = [IntPtr]::new(6)
-# SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER
-$SWP_FLAGS = 0x0001 -bor 0x0002 -bor 0x0010 -bor 0x0200
-$GW_HWNDLAST = 1
-$VK_MENU = 0x12      # ALT key - brief synthetic tap unlocks SetForegroundWindow
-$KEYEVENTF_KEYUP = 2
-
-function Test-IsConsoleWindow {
-    param([IntPtr]$Hwnd)
-
-    if ($Hwnd -eq [IntPtr]::Zero) { return $false }
-
-    $sb = New-Object System.Text.StringBuilder 256
-    [void][Native.Win]::GetClassName($Hwnd, $sb, 256)
-    if ($ConsoleClasses -contains $sb.ToString()) { return $true }
-
-    # Fallback: match by owning process name
-    $procId = 0
-    [void][Native.Win]::GetWindowThreadProcessId($Hwnd, [ref]$procId)
-    if ($procId -eq 0) { return $false }
-    try {
-        $proc = Get-Process -Id $procId -ErrorAction Stop
-        return ($ProcessNames -contains $proc.ProcessName)
-    } catch { return $false }
-}
-
-function Get-AllWindows {
-    $list = New-Object System.Collections.Generic.List[IntPtr]
-    $callback = [Native.Win+EnumWindowsProc]{
-        param([IntPtr]$h, [IntPtr]$l)
-        $list.Add($h)
-        return $true
-    }
-    [void][Native.Win]::EnumWindows($callback, [IntPtr]::Zero)
-    return $list
-}
-
-function Restore-Focus {
-    # Background processes are normally blocked from setting focus.
-    # A synthetic ALT tap unlocks SetForegroundWindow for a moment.
-    param([IntPtr]$Hwnd)
-    if ($Hwnd -eq [IntPtr]::Zero) { return }
-    [void][Native.Win]::keybd_event($VK_MENU, 0, 0, [System.UIntPtr]::Zero)
-    [void][Native.Win]::keybd_event($VK_MENU, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
-    [void][Native.Win]::SetForegroundWindow($Hwnd)
-}
-
-Write-Host "KeepTerminalsBehind v2 is running. Console flash-popups will be suppressed." -ForegroundColor Cyan
-Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
-
-# hwnd -> was it visible last tick?
-$known = @{}
-# The last window the user was genuinely working in (non-console foreground)
-$lastGood = [IntPtr]::Zero
-
-while ($true) {
-    try {
-        $fg = [Native.Win]::GetForegroundWindow()
-        $fgIsConsole = Test-IsConsoleWindow -Hwnd $fg
-
-        if ($fg -ne [IntPtr]::Zero -and -not $fgIsConsole) {
-            $lastGood = $fg
+            // Fallback: owning process name
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0) return false;
+            try
+            {
+                string name = Process.GetProcessById((int)pid).ProcessName;
+                return procNames.Contains(name);
+            }
+            catch { return false; }
         }
 
-        foreach ($hwnd in (Get-AllWindows)) {
-            $visible = [Native.Win]::IsWindowVisible($hwnd)
-            $wasVisible = if ($known.ContainsKey($hwnd)) { $known[$hwnd] } else { $false }
+        static bool IsAtBottom(IntPtr hwnd)
+        {
+            IntPtr last = GetWindow(hwnd, GW_HWNDLAST);
+            return last == IntPtr.Zero || last == hwnd;
+        }
 
-            if ($visible -and -not [Native.Win]::IsIconic($hwnd) -and (Test-IsConsoleWindow -Hwnd $hwnd)) {
+        static void PushBottom(IntPtr hwnd)
+        {
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_FLAGS);
+        }
 
-                if ($hwnd -eq $fg) {
-                    if (-not $fgIsConsole) { throw 'unreachable' }
+        static void RestoreFocus(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);          // synthetic ALT tap unlocks
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero); // SetForegroundWindow
+            SetForegroundWindow(hwnd);
+        }
 
-                    if ($hwnd -eq $lastGood) {
-                        # User is deliberately using this console - leave it alone
-                    }
-                    elseif ($lastGood -ne [IntPtr]::Zero -and -not $wasVisible) {
-                        # A console that just spawned (or just re-appeared) grabbed
-                        # focus. Push it behind and give focus back to the user.
-                        [void][Native.Win]::SetWindowPos($hwnd, $HWND_BOTTOM, 0, 0, 0, 0, $SWP_FLAGS)
-                        Restore-Focus -Hwnd $lastGood
-                    }
-                    # (if it was already visible before becoming foreground, the
-                    #  user alt-tabbed / clicked it on purpose -> leave it)
-                }
-                else {
-                    # Visible, non-foreground console window: keep it at the back.
-                    # Only move it if it isn't already at the very bottom.
-                    $bottom = [Native.Win]::GetWindow($hwnd, $GW_HWNDLAST)
-                    if ($bottom -ne [IntPtr]::Zero -and $bottom -ne $hwnd) {
-                        [void][Native.Win]::SetWindowPos($hwnd, $HWND_BOTTOM, 0, 0, 0, 0, $SWP_FLAGS)
-                    }
-                }
+        // EVENT_OBJECT_SHOW: a window just became visible
+        static void ShowHandler(IntPtr hHook, uint eventId, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+        {
+            if (idObject != 0) return; // only OBJID_WINDOW
+            if (!IsConsoleWindow(hwnd)) return;
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+
+            IntPtr fg = GetForegroundWindow();
+            if (fg == hwnd) HandleForeground(hwnd);
+            else PushBottom(hwnd);
+        }
+
+        // EVENT_SYSTEM_FOREGROUND: the foreground window changed
+        static void FgHandler(IntPtr hHook, uint eventId, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+        {
+            if (idObject != 0 || idChild != 0) return; // only OBJID_WINDOW / index 0
+            HandleForeground(hwnd);
+        }
+
+        static void HandleForeground(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+
+            if (!IsConsoleWindow(hwnd))
+            {
+                lock (gate) { lastGood = hwnd; }
+                return;
             }
 
-            $known[$hwnd] = $visible
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+            if (hwnd == lastGood) return; // user is deliberately using it
+
+            bool wasVisible;
+            lock (gate) { wasVisible = knownVisible.Contains(hwnd); }
+
+            // Suppress only flash popups: consoles that just spawned/re-appeared
+            // and grabbed focus. Consoles the user clicked (already visible)
+            // are left alone.
+            if (!wasVisible && lastGood != IntPtr.Zero)
+            {
+                PushBottom(hwnd);
+                RestoreFocus(lastGood);
+            }
         }
 
-        # Occasionally prune dead hwnds from tracking
-        if ($known.Count -gt 400) {
-            $dead = @($known.Keys | Where-Object { $null -eq $_ -or $_ -eq [IntPtr]::Zero })
-            foreach ($d in $dead) { $known.Remove($d) }
+        // Backstop sweep: every second, send any visible non-foreground
+        // console window to the bottom and refresh visibility tracking.
+        static void Backstop(object state)
+        {
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                var visibleConsoles = new HashSet<IntPtr>();
+
+                EnumWindows(delegate(IntPtr h, IntPtr l)
+                {
+                    if (IsWindowVisible(h) && !IsIconic(h) && IsConsoleWindow(h))
+                    {
+                        visibleConsoles.Add(h);
+                        if (h != fg && !IsAtBottom(h)) PushBottom(h);
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                lock (gate)
+                {
+                    knownVisible.Clear();
+                    foreach (IntPtr h in visibleConsoles) knownVisible.Add(h);
+                    if (fg != IntPtr.Zero && !IsConsoleWindow(fg)) lastGood = fg;
+                }
+            }
+            catch { }
         }
-    } catch {
-        # Keep running even if something odd happens mid-loop
+
+        public static void Run(string[] names)
+        {
+            foreach (string n in names) procNames.Add(n);
+
+            fgHandler = new WinEventDelegate(FgHandler);
+            showHandler = new WinEventDelegate(ShowHandler);
+
+            SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, fgHandler, 0, 0, WINEVENT_OUTOFCONTEXT);
+            SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, IntPtr.Zero, showHandler, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+            var backstop = new System.Threading.Timer(Backstop, null, 1000, 1000);
+
+            // Message pump required for the hooks to deliver events
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+        }
     }
-
-    Start-Sleep -Milliseconds ([int]($IntervalSeconds * 1000))
 }
+"@
+
+Write-Host "KeepTerminalsBehind v3 (event-driven) is running." -ForegroundColor Cyan
+Write-Host "Console flash-popups are suppressed in real time. Press Ctrl+C to stop." -ForegroundColor DarkGray
+
+[KTB.Hook]::Run($script:ProcNames)
