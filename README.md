@@ -8,13 +8,17 @@ Many Windows apps (dev tools, sync clients, schedulers, AI agents...) silently s
 
 ## The fix
 
-`KeepTerminalsBehind.ps1` is **event-driven**: it registers Windows event hooks (`SetWinEventHook`) and reacts within milliseconds of a console window taking focus or becoming visible — pushing it to the bottom of the Z-order with `SetWindowPos(HWND_BOTTOM)` and handing focus back to the window you were using. A fast 100ms sweep runs as a backstop for consoles that appear or get raised without taking focus.
+`KeepTerminalsBehind.ps1` is **event-driven**: it registers Windows event hooks (`SetWinEventHook`) and reacts within milliseconds of a console window becoming visible or taking focus — **hiding it and moving it far off-screen** so it can never paint over your work, then handing focus back to the window you were using. A fast 100ms sweep runs as a backstop for consoles that appear or get raised without taking focus.
 
 ### Safety rules
 
-- The **foreground window is never touched** — if you deliberately click a terminal, it stays where you put it until you switch away.
+- If your **mouse cursor is over** a terminal when it appears or takes focus, it is left alone (you are using it).
 - **Minimized** windows are left alone.
 - Only console-class windows (`ConsoleWindowClass`, `CASCADIA_HOSTING_WINDOW_CLASS`) or windows owned by `cmd` / `powershell` / `pwsh` / `WindowsTerminal` / `conhost` are managed. Regular apps are never moved.
+
+## Auto-update
+
+`install.ps1` also registers a daily scheduled task (**KeepTerminalsBehind-Update**, 09:00) that runs `update.ps1`: it pulls the latest from GitHub, copies it over the installed script, and restarts the watcher only if it is running. Run `update.ps1` manually anytime to force a check.
 
 ## Install
 

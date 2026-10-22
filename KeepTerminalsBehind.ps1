@@ -3,7 +3,7 @@
   Keeps cmd / PowerShell / Windows Terminal windows from interrupting you.
 
 .DESCRIPTION
-  v6 - EVENT-DRIVEN with fast sweep + two-strike suppression.
+  v7 - EVENT-DRIVEN; suppression = hide + move off-screen. No exceptions
 
   Registers Windows event hooks (SetWinEventHook) for focus changes and
   window-show events, plus a fast 100ms sweep as a backstop for windows
@@ -97,7 +97,7 @@ namespace KTB
         // ---------- state ----------
         static readonly object gate = new object();
         static IntPtr lastGood = IntPtr.Zero;
-        static readonly HashSet<IntPtr> userOwned = new HashSet<IntPtr>();     // consoles the user clicked into
+        static readonly Dictionary<string, DateTime> foreignLog = new Dictionary<string, DateTime>();
         static readonly Dictionary<IntPtr, int> violations = new Dictionary<IntPtr, int>();
         static string logPath = "";
         static WinEventDelegate fgHandler;
@@ -168,10 +168,12 @@ namespace KTB
                 count = count + 1;
             }
 
-            // Hide immediately: popup consoles are one-shot script runs whose
-            // output goes to log files. Minimizing still flashes + shows in the
-            // taskbar, and popup bursts are all fresh windows anyway.
+            // Hide immediately AND move far off-screen. Some hosts (newer
+            // Windows Terminal) can ignore or re-show a hidden window, so the
+            // off-screen move guarantees it can never paint over your work
+            // even if a hide or show event is missed.
             ShowWindowAsync(hwnd, SW_HIDE);
+            SetWindowPos(hwnd, IntPtr.Zero, -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010 | 0x0200); // NOSIZE|NOZORDER|NOACTIVATE|NOOWNERZORDER
             Log("SUPPRESSED ({0}) strike {1} -> HIDDEN {2}", reason, count, Describe(hwnd));
         }
 
@@ -181,6 +183,40 @@ namespace KTB
             keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
             keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
             SetForegroundWindow(hwnd);
+        }
+
+        static bool CursorInside(IntPtr hwnd)
+        {
+            POINT p; RECT r;
+            GetCursorPos(out p);
+            GetWindowRect(hwnd, out r);
+            return p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
+        }
+
+        // Diagnostics: rate-limited log of NON-console windows taking the
+        // foreground, so anything we do NOT manage shows up in the log.
+        static void LogForeign(IntPtr hwnd)
+        {
+            if (logPath == "") return;
+            try
+            {
+                var sb = new System.Text.StringBuilder(256);
+                GetClassName(hwnd, sb, 256);
+                string cls = sb.ToString();
+                if (cls == "WorkerW" || cls == "Progman" || cls == "Shell_TrayWnd") return;
+                uint pid; GetWindowThreadProcessId(hwnd, out pid);
+                string proc = "?";
+                try { proc = Process.GetProcessById((int)pid).ProcessName; } catch { }
+                string key = cls + "/" + proc;
+                DateTime last;
+                lock (gate)
+                {
+                    if (foreignLog.TryGetValue(key, out last) && (DateTime.Now - last).TotalSeconds < 10) return;
+                    foreignLog[key] = DateTime.Now;
+                }
+                Log("FG -> other {0} (not managed)", key);
+            }
+            catch { }
         }
 
         // EVENT_OBJECT_SHOW: a window just became visible
@@ -194,9 +230,7 @@ namespace KTB
             if (fg == hwnd) HandleForeground(hwnd);
             else
             {
-                bool owned;
-                lock (gate) { owned = userOwned.Contains(hwnd); }
-                if (owned) return;
+                if (CursorInside(hwnd)) return;   // user is right there - hands off
                 Suppress(hwnd, "show");
             }
         }
@@ -215,19 +249,14 @@ namespace KTB
             if (!IsConsoleWindow(hwnd))
             {
                 lock (gate) { lastGood = hwnd; }
+                LogForeign(hwnd);
                 return;
             }
 
             if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
 
-            POINT p; RECT r;
-            GetCursorPos(out p);
-            GetWindowRect(hwnd, out r);
-            bool cursorInside = p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
-
-            if (cursorInside)
+            if (CursorInside(hwnd))
             {
-                lock (gate) { userOwned.Add(hwnd); }
                 Log("FG -> console {0} CURSOR INSIDE - user-owned, protected", Describe(hwnd));
                 return;
             }
@@ -251,9 +280,7 @@ namespace KTB
                 {
                     if (IsWindowVisible(h) && !IsIconic(h) && IsConsoleWindow(h))
                     {
-                        bool owned;
-                        lock (gate) { owned = userOwned.Contains(h); }
-                        if (h == fg || owned) return true;
+                        if (h == fg || CursorInside(h)) return true;
                         if (IsAtBottom(h)) return true;
                         Suppress(h, "sweep");
                     }
@@ -268,11 +295,8 @@ namespace KTB
                 // prune dead handles
                 lock (gate)
                 {
-                    if (userOwned.Count > 50 || violations.Count > 50)
+                    if (violations.Count > 50)
                     {
-                        var deadU = new List<IntPtr>();
-                        foreach (var h in userOwned) if (!IsWindow(h)) deadU.Add(h);
-                        foreach (var h in deadU) userOwned.Remove(h);
                         var deadV = new List<IntPtr>();
                         foreach (var kv in violations) if (!IsWindow(kv.Key)) deadV.Add(kv.Key);
                         foreach (var h in deadV) violations.Remove(h);
@@ -286,7 +310,7 @@ namespace KTB
         {
             foreach (string n in names) procNames.Add(n);
             logPath = logFile == null ? "" : logFile;
-            Log("===== KeepTerminalsBehind v6 started =====");
+            Log("===== KeepTerminalsBehind v7 started =====");
 
             fgHandler = new WinEventDelegate(FgHandler);
             showHandler = new WinEventDelegate(ShowHandler);
@@ -309,7 +333,7 @@ namespace KTB
 }
 "@
 
-Write-Host "KeepTerminalsBehind v6 (100ms sweep + two-strike suppression) is running." -ForegroundColor Cyan
+Write-Host "KeepTerminalsBehind v7 (hide + off-screen suppression) is running." -ForegroundColor Cyan
 if ($script:LogPath) { Write-Host "Log: $script:LogPath" -ForegroundColor DarkGray }
 
 [KTB.Hook]::Run($script:ProcNames, $script:LogPath)
