@@ -16,6 +16,20 @@ if (-not (Test-Path (Join-Path $sourceDir 'KeepTerminalsBehind.ps1'))) {
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item (Join-Path $sourceDir 'KeepTerminalsBehind.ps1') $scriptPath -Force
+Copy-Item (Join-Path $sourceDir 'update.ps1') (Join-Path $installDir 'update.ps1') -Force
+
+# Register a daily auto-update task (runs update.ps1, no admin needed)
+try {
+    $action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\update.ps1`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At '09:00'
+    Register-ScheduledTask -TaskName 'KeepTerminalsBehind-Update' -Action $action -Trigger $trigger `
+        -Description 'Updates Keep Terminals Behind from GitHub and restarts it if running' `
+        -RunLevel Limited -Force | Out-Null
+    Write-Host "Daily auto-update task registered: KeepTerminalsBehind-Update" -ForegroundColor Green
+} catch {
+    Write-Warning "Could not register auto-update task: $_"
+}
 
 # Create the startup shortcut
 $shell = New-Object -ComObject WScript.Shell

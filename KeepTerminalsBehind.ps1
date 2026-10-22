@@ -31,7 +31,7 @@
 #>
 
 param(
-    [string[]]$ProcessNames = @('cmd', 'powershell', 'pwsh', 'WindowsTerminal', 'conhost'),
+    [string[]]$ProcessNames = @('cmd', 'powershell', 'pwsh', 'WindowsTerminal', 'conhost', 'mintty', 'wt', 'OpenConsole'),
     [string]$LogPath = "$env:TEMP\KeepTerminalsBehind.log",
     [switch]$DisableLog
 )
@@ -90,7 +90,7 @@ namespace KTB
         const int SW_MINIMIZE = 6;
         const int SW_HIDE = 0;
 
-        static readonly string[] ConsoleClasses = new string[] { "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow" };
+        static readonly string[] ConsoleClasses = new string[] { "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow", "mintty" };
         const string DragBarClass = "DRAG_BAR_WINDOW_CLASS"; // WT-internal child window - never touch
         static HashSet<string> procNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
