@@ -18,6 +18,18 @@ New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item (Join-Path $sourceDir 'KeepTerminalsBehind.ps1') $scriptPath -Force
 Copy-Item (Join-Path $sourceDir 'update.ps1') (Join-Path $installDir 'update.ps1') -Force
 
+# Host background-spawned consoles with plain conhost instead of Windows
+# Terminal. WT re-creates/re-shows its window for every console session and
+# briefly steals focus; conhost windows are hidden instantly by the watcher.
+try {
+    New-Item -Path 'HKCU:\Console\%%Startup' -Force | Out-Null
+    Set-ItemProperty 'HKCU:\Console\%%Startup' -Name DelegationConsole  -Value '{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}'
+    Set-ItemProperty 'HKCU:\Console\%%Startup' -Name DelegationTerminal -Value '{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}'
+    Write-Host 'Default terminal hosting set to Windows Console Host (no WT popup flicker).' -ForegroundColor Green
+} catch {
+    Write-Warning "Could not set console delegation: $_"
+}
+
 # Register a daily auto-update task (runs update.ps1, no admin needed)
 try {
     $action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
