@@ -12,7 +12,7 @@ Many Windows apps (dev tools, sync clients, schedulers, AI agents...) silently s
 
 ### Safety rules
 
-- If your **mouse cursor is over** a terminal when it appears or takes focus, it is left alone (you are using it).
+- A terminal that **spawns under your cursor** is never protected — it is sent to the very back of the Z-order (no focus steal, no hiding). Only a terminal you **deliberately raise** (seen on screen before, cursor over it) is left alone.
 - **Minimized** windows are left alone.
 - Only console-class windows (`ConsoleWindowClass`, `CASCADIA_HOSTING_WINDOW_CLASS`) or windows owned by `cmd` / `powershell` / `pwsh` / `WindowsTerminal` / `conhost` are managed. Regular apps are never moved.
 

@@ -3,7 +3,8 @@
   Keeps cmd / PowerShell / Windows Terminal windows from interrupting you.
 
 .DESCRIPTION
-  v7 - EVENT-DRIVEN; suppression = hide + move off-screen. No exceptions
+  v8 - EVENT-DRIVEN; suppression = hide + move off-screen. Spawns that appear
+  under the cursor are sent to the very back of the Z-order (never protected).
 
   Registers Windows event hooks (SetWinEventHook) for focus changes and
   window-show events, plus a fast 100ms sweep as a backstop for windows
@@ -31,7 +32,7 @@
 #>
 
 param(
-    [string[]]$ProcessNames = @('cmd', 'powershell', 'pwsh', 'WindowsTerminal', 'conhost', 'mintty', 'wt', 'OpenConsole'),
+    [string[]]$ProcessNames = @('cmd', 'powershell', 'pwsh', 'WindowsTerminal', 'conhost', 'mintty', 'wt', 'OpenConsole', 'node'),
     [string]$LogPath = "$env:TEMP\KeepTerminalsBehind.log",
     [switch]$DisableLog
 )
@@ -99,6 +100,7 @@ namespace KTB
         static IntPtr lastGood = IntPtr.Zero;
         static readonly Dictionary<string, DateTime> foreignLog = new Dictionary<string, DateTime>();
         static readonly Dictionary<IntPtr, int> violations = new Dictionary<IntPtr, int>();
+        static readonly HashSet<IntPtr> seenWindows = new HashSet<IntPtr>();   // windows observed at show-time
         static string logPath = "";
         static WinEventDelegate fgHandler;
         static WinEventDelegate showHandler;
@@ -185,6 +187,15 @@ namespace KTB
             SetForegroundWindow(hwnd);
         }
 
+        // Push a window to the very back of the Z-order WITHOUT hiding it.
+        // Used when a console spawns under the cursor: it must not steal
+        // focus, but hiding it would make it unfindable, so it goes behind
+        // everything instead.
+        static void SendToBack(IntPtr hwnd)
+        {
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200); // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER
+        }
+
         static bool CursorInside(IntPtr hwnd)
         {
             POINT p; RECT r;
@@ -226,11 +237,20 @@ namespace KTB
             if (!IsConsoleWindow(hwnd)) return;
             if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
 
+            lock (gate) { seenWindows.Add(hwnd); }   // observed alive at show-time
+
             IntPtr fg = GetForegroundWindow();
             if (fg == hwnd) HandleForeground(hwnd);
             else
             {
-                if (CursorInside(hwnd)) return;   // user is right there - hands off
+                if (CursorInside(hwnd))
+                {
+                    // Fresh spawn that happened to appear under the cursor:
+                    // never protect it, just send it behind everything.
+                    SendToBack(hwnd);
+                    Log("SHOW -> console {0} spawned under cursor -> BEHIND", Describe(hwnd));
+                    return;
+                }
                 Suppress(hwnd, "show");
             }
         }
@@ -257,6 +277,19 @@ namespace KTB
 
             if (CursorInside(hwnd))
             {
+                bool seen;
+                lock (gate) { seen = seenWindows.Contains(hwnd); }
+                if (!seen)
+                {
+                    // Became foreground with the cursor over it but was never
+                    // observed as a shown window first: a self-activating
+                    // spawn that happened to appear under the cursor. Send it
+                    // behind everything and hand focus back.
+                    SendToBack(hwnd);
+                    RestoreFocus(lastGood);
+                    Log("FG -> console {0} spawned under cursor -> BEHIND", Describe(hwnd));
+                    return;
+                }
                 Log("FG -> console {0} CURSOR INSIDE - user-owned, protected", Describe(hwnd));
                 return;
             }
@@ -300,6 +333,9 @@ namespace KTB
                         var deadV = new List<IntPtr>();
                         foreach (var kv in violations) if (!IsWindow(kv.Key)) deadV.Add(kv.Key);
                         foreach (var h in deadV) violations.Remove(h);
+                        var deadS = new List<IntPtr>();
+                        foreach (var h in seenWindows) if (!IsWindow(h)) deadS.Add(h);
+                        foreach (var h in deadS) seenWindows.Remove(h);
                     }
                 }
             }
@@ -310,7 +346,7 @@ namespace KTB
         {
             foreach (string n in names) procNames.Add(n);
             logPath = logFile == null ? "" : logFile;
-            Log("===== KeepTerminalsBehind v7 started =====");
+            Log("===== KeepTerminalsBehind v8 started =====");
 
             fgHandler = new WinEventDelegate(FgHandler);
             showHandler = new WinEventDelegate(ShowHandler);
@@ -333,7 +369,7 @@ namespace KTB
 }
 "@
 
-Write-Host "KeepTerminalsBehind v7 (hide + off-screen suppression) is running." -ForegroundColor Cyan
+Write-Host "KeepTerminalsBehind v8 (hide + off-screen + behind-on-spawn) is running." -ForegroundColor Cyan
 if ($script:LogPath) { Write-Host "Log: $script:LogPath" -ForegroundColor DarkGray }
 
 [KTB.Hook]::Run($script:ProcNames, $script:LogPath)
