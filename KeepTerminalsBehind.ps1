@@ -3,8 +3,8 @@
   Keeps cmd / PowerShell / Windows Terminal windows from interrupting you.
 
 .DESCRIPTION
-  v8 - EVENT-DRIVEN; suppression = hide + move off-screen. Spawns that appear
-  under the cursor are sent to the very back of the Z-order (never protected).
+  v9 - EVENT-DRIVEN; suppression = hide + move off-screen, ALWAYS. Background
+  console spawns are never visible, even when they appear under the cursor.
 
   Registers Windows event hooks (SetWinEventHook) for focus changes and
   window-show events, plus a fast 100ms sweep as a backstop for windows
@@ -187,15 +187,6 @@ namespace KTB
             SetForegroundWindow(hwnd);
         }
 
-        // Push a window to the very back of the Z-order WITHOUT hiding it.
-        // Used when a console spawns under the cursor: it must not steal
-        // focus, but hiding it would make it unfindable, so it goes behind
-        // everything instead.
-        static void SendToBack(IntPtr hwnd)
-        {
-            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200); // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER
-        }
-
         static bool CursorInside(IntPtr hwnd)
         {
             POINT p; RECT r;
@@ -243,14 +234,8 @@ namespace KTB
             if (fg == hwnd) HandleForeground(hwnd);
             else
             {
-                if (CursorInside(hwnd))
-                {
-                    // Fresh spawn that happened to appear under the cursor:
-                    // never protect it, just send it behind everything.
-                    SendToBack(hwnd);
-                    Log("SHOW -> console {0} spawned under cursor -> BEHIND", Describe(hwnd));
-                    return;
-                }
+                // Fresh spawn: hide it no matter what, even if it appeared
+                // under the cursor. Background spawns must never be visible.
                 Suppress(hwnd, "show");
             }
         }
@@ -283,11 +268,9 @@ namespace KTB
                 {
                     // Became foreground with the cursor over it but was never
                     // observed as a shown window first: a self-activating
-                    // spawn that happened to appear under the cursor. Send it
-                    // behind everything and hand focus back.
-                    SendToBack(hwnd);
+                    // spawn. Hide it and hand focus back.
+                    Suppress(hwnd, "fg-spawn");
                     RestoreFocus(lastGood);
-                    Log("FG -> console {0} spawned under cursor -> BEHIND", Describe(hwnd));
                     return;
                 }
                 Log("FG -> console {0} CURSOR INSIDE - user-owned, protected", Describe(hwnd));
@@ -346,7 +329,7 @@ namespace KTB
         {
             foreach (string n in names) procNames.Add(n);
             logPath = logFile == null ? "" : logFile;
-            Log("===== KeepTerminalsBehind v8 started =====");
+            Log("===== KeepTerminalsBehind v9 started =====");
 
             fgHandler = new WinEventDelegate(FgHandler);
             showHandler = new WinEventDelegate(ShowHandler);
@@ -369,7 +352,7 @@ namespace KTB
 }
 "@
 
-Write-Host "KeepTerminalsBehind v8 (hide + off-screen + behind-on-spawn) is running." -ForegroundColor Cyan
+Write-Host "KeepTerminalsBehind v9 (hide + off-screen, no visible spawns) is running." -ForegroundColor Cyan
 if ($script:LogPath) { Write-Host "Log: $script:LogPath" -ForegroundColor DarkGray }
 
 [KTB.Hook]::Run($script:ProcNames, $script:LogPath)
