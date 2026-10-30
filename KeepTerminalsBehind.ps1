@@ -3,8 +3,9 @@
   Keeps cmd / PowerShell / Windows Terminal windows from interrupting you.
 
 .DESCRIPTION
-  v9 - EVENT-DRIVEN; suppression = hide + move off-screen, ALWAYS. Background
-  console spawns are never visible, even when they appear under the cursor.
+  v10 - EVENT-DRIVEN; suppression = hide + move off-screen, ALWAYS. Background
+  console spawns are never visible - cursor protection only applies to windows
+  that have been on screen for 3+ seconds (deliberately raised by the user).
 
   Registers Windows event hooks (SetWinEventHook) for focus changes and
   window-show events, plus a fast 100ms sweep as a backstop for windows
@@ -100,7 +101,7 @@ namespace KTB
         static IntPtr lastGood = IntPtr.Zero;
         static readonly Dictionary<string, DateTime> foreignLog = new Dictionary<string, DateTime>();
         static readonly Dictionary<IntPtr, int> violations = new Dictionary<IntPtr, int>();
-        static readonly HashSet<IntPtr> seenWindows = new HashSet<IntPtr>();   // windows observed at show-time
+        static readonly Dictionary<IntPtr, DateTime> seenWindows = new Dictionary<IntPtr, DateTime>();   // when each window was first observed
         static string logPath = "";
         static WinEventDelegate fgHandler;
         static WinEventDelegate showHandler;
@@ -228,7 +229,10 @@ namespace KTB
             if (!IsConsoleWindow(hwnd)) return;
             if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
 
-            lock (gate) { seenWindows.Add(hwnd); }   // observed alive at show-time
+            lock (gate)
+            {
+                if (!seenWindows.ContainsKey(hwnd)) seenWindows[hwnd] = DateTime.Now;
+            }
 
             IntPtr fg = GetForegroundWindow();
             if (fg == hwnd) HandleForeground(hwnd);
@@ -262,13 +266,17 @@ namespace KTB
 
             if (CursorInside(hwnd))
             {
-                bool seen;
-                lock (gate) { seen = seenWindows.Contains(hwnd); }
-                if (!seen)
+                // Only protect windows that have been on screen for a while -
+                // i.e. the user had time to see and deliberately raise them.
+                // A console that grabs foreground within seconds of appearing
+                // is a self-activating background spawn, cursor or not.
+                DateTime first;
+                lock (gate)
                 {
-                    // Became foreground with the cursor over it but was never
-                    // observed as a shown window first: a self-activating
-                    // spawn. Hide it and hand focus back.
+                    if (!seenWindows.TryGetValue(hwnd, out first)) first = DateTime.Now;
+                }
+                if ((DateTime.Now - first).TotalSeconds < 3)
+                {
                     Suppress(hwnd, "fg-spawn");
                     RestoreFocus(lastGood);
                     return;
@@ -317,7 +325,7 @@ namespace KTB
                         foreach (var kv in violations) if (!IsWindow(kv.Key)) deadV.Add(kv.Key);
                         foreach (var h in deadV) violations.Remove(h);
                         var deadS = new List<IntPtr>();
-                        foreach (var h in seenWindows) if (!IsWindow(h)) deadS.Add(h);
+                        foreach (var h in seenWindows.Keys) if (!IsWindow(h)) deadS.Add(h);
                         foreach (var h in deadS) seenWindows.Remove(h);
                     }
                 }
@@ -329,7 +337,7 @@ namespace KTB
         {
             foreach (string n in names) procNames.Add(n);
             logPath = logFile == null ? "" : logFile;
-            Log("===== KeepTerminalsBehind v9 started =====");
+            Log("===== KeepTerminalsBehind v10 started =====");
 
             fgHandler = new WinEventDelegate(FgHandler);
             showHandler = new WinEventDelegate(ShowHandler);
@@ -352,7 +360,7 @@ namespace KTB
 }
 "@
 
-Write-Host "KeepTerminalsBehind v9 (hide + off-screen, no visible spawns) is running." -ForegroundColor Cyan
+Write-Host "KeepTerminalsBehind v10 (hide + off-screen; spawn-proof cursor rule) is running." -ForegroundColor Cyan
 if ($script:LogPath) { Write-Host "Log: $script:LogPath" -ForegroundColor DarkGray }
 
 [KTB.Hook]::Run($script:ProcNames, $script:LogPath)
